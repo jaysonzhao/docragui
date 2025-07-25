@@ -26,6 +26,7 @@ class S3Uploader:
             self.s3_client = boto3.client(
                 's3',
                 aws_access_key_id=app.config['AWS_ACCESS_KEY_ID'],
+                endpoint_url="http://minio-service.minio.svc.cluster.local:9000",
                 aws_secret_access_key=app.config['AWS_SECRET_ACCESS_KEY'],
                 region_name=app.config['S3_REGION']
             )
