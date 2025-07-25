@@ -6,6 +6,7 @@ from config import Config
 import uuid
 from datetime import datetime
 from botocore.exceptions import ClientError, NoCredentialsError
+import io
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -32,6 +33,7 @@ class S3Uploader:
             )
             # 测试连接
             self.s3_client.head_bucket(Bucket=app.config['S3_BUCKET_NAME'])
+            print(f"成功连接到MinIO，存储桶: {app.config['S3_BUCKET_NAME']}")
         except Exception as e:
             print(f"S3初始化错误: {str(e)}")
             self.s3_client = None
@@ -48,30 +50,38 @@ class S3Uploader:
             file_extension = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
             unique_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{secure_filename(filename)}"
             
-            # 重置文件指针到开始位置
+            # 一次性读取文件内容到内存，避免多次seek操作
             file.seek(0)
+            file_content = file.read()
+            file_size = len(file_content)
             
-            # 上传文件到S3
+            # 创建新的BytesIO对象用于上传
+            file_obj = io.BytesIO(file_content)
+            
+            # 设置上传到docs文件夹下的完整路径
+            upload_key = f"docs/{unique_filename}"
+            
+            print(f"开始上传文件到: {app.config['S3_BUCKET_NAME']}/{upload_key}")
+            
+            # 上传文件到MinIO/S3的docs文件夹
             self.s3_client.upload_fileobj(
-                file,
+                file_obj,
                 app.config['S3_BUCKET_NAME'],
-                unique_filename,
+                upload_key,
                 ExtraArgs={
                     'ContentType': file.content_type or 'application/octet-stream',
                     'Metadata': {
                         'original_filename': filename,
-                        'upload_timestamp': datetime.now().isoformat()
+                        'upload_timestamp': datetime.now().isoformat(),
+                        'file_size': str(file_size)
                     }
                 }
             )
             
-            # 生成文件URL
-            file_url = f"http://minio-service.minio.svc.cluster.local:9000/{app.config['S3_BUCKET_NAME']}/docs/{unique_filename}"
+            # 生成文件访问URL
+            file_url = f"http://minio-service.minio.svc.cluster.local:9000/{app.config['S3_BUCKET_NAME']}/{upload_key}"
             
-            # 获取文件大小
-            file.seek(0, 2)  # 移动到文件末尾
-            file_size = file.tell()
-            file.seek(0)  # 重置到开始位置
+            print(f"文件上传成功: {upload_key}")
             
             return {
                 'success': True,
@@ -79,7 +89,9 @@ class S3Uploader:
                 'original_filename': filename,
                 'url': file_url,
                 'size': file_size,
-                'upload_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                'upload_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'upload_key': upload_key,
+                'folder': 'docs'
             }
         except NoCredentialsError:
             return {
@@ -104,35 +116,94 @@ class S3Uploader:
                     'error': f'AWS错误: {str(e)}'
                 }
         except Exception as e:
+            print(f"上传错误: {str(e)}")
             return {
                 'success': False,
                 'error': f'上传失败: {str(e)}'
             }
     
     def list_recent_files(self, limit=10):
-        """获取最近上传的文件列表"""
+        """获取docs文件夹下最近上传的文件列表"""
         if not self.s3_client:
             return {'success': False, 'error': 'S3客户端未初始化'}
         
         try:
+            # 只列出docs文件夹下的文件
             response = self.s3_client.list_objects_v2(
                 Bucket=app.config['S3_BUCKET_NAME'],
+                Prefix='docs/',  # 只获取docs文件夹下的文件
                 MaxKeys=limit
             )
             
             files = []
             if 'Contents' in response:
-                for obj in sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True):
+                # 过滤掉文件夹本身，只保留文件
+                file_objects = [obj for obj in response['Contents'] if not obj['Key'].endswith('/')]
+                
+                for obj in sorted(file_objects, key=lambda x: x['LastModified'], reverse=True):
+                    # 从完整路径中提取文件名
+                    display_name = obj['Key'].replace('docs/', '', 1)
+                    
                     files.append({
-                        'key': obj['Key'],
+                        'key': obj['Key'],  # 完整的key路径 (docs/filename)
+                        'display_name': display_name,  # 显示用的文件名
                         'size': obj['Size'],
                         'last_modified': obj['LastModified'].strftime('%Y-%m-%d %H:%M:%S'),
-                        'url': f"http://minio-service.minio.svc.cluster.local:9000/{app.config['S3_BUCKET_NAME']}/docs/{obj['Key']}"
+                        'url': f"http://minio-service.minio.svc.cluster.local:9000/{app.config['S3_BUCKET_NAME']}/{obj['Key']}"
                     })
             
-            return {'success': True, 'files': files}
+            return {'success': True, 'files': files, 'folder': 'docs'}
         except Exception as e:
+            print(f"列出文件错误: {str(e)}")
             return {'success': False, 'error': str(e)}
+    
+    def delete_file(self, file_key):
+        """删除docs文件夹下的文件"""
+        if not self.s3_client:
+            return {'success': False, 'error': 'S3客户端未初始化'}
+        
+        try:
+            # 确保文件key以docs/开头
+            if not file_key.startswith('docs/'):
+                file_key = f"docs/{file_key}"
+            
+            print(f"删除文件: {file_key}")
+            
+            self.s3_client.delete_object(
+                Bucket=app.config['S3_BUCKET_NAME'],
+                Key=file_key
+            )
+            return {'success': True, 'message': f'文件 {file_key} 删除成功'}
+        except Exception as e:
+            print(f"删除文件错误: {str(e)}")
+            return {'success': False, 'error': f'删除失败: {str(e)}'}
+    
+    def get_file_info(self, file_key):
+        """获取文件详细信息"""
+        if not self.s3_client:
+            return {'success': False, 'error': 'S3客户端未初始化'}
+        
+        try:
+            # 确保文件key以docs/开头
+            if not file_key.startswith('docs/'):
+                file_key = f"docs/{file_key}"
+            
+            response = self.s3_client.head_object(
+                Bucket=app.config['S3_BUCKET_NAME'],
+                Key=file_key
+            )
+            
+            return {
+                'success': True,
+                'key': file_key,
+                'size': response['ContentLength'],
+                'last_modified': response['LastModified'].strftime('%Y-%m-%d %H:%M:%S'),
+                'content_type': response['ContentType'],
+                'metadata': response.get('Metadata', {}),
+                'url': f"http://minio-service.minio.svc.cluster.local:9000/{app.config['S3_BUCKET_NAME']}/{file_key}"
+            }
+        except Exception as e:
+            return {'success': False, 'error': f'获取文件信息失败: {str(e)}'}
 
 # 初始化S3上传器
 s3_uploader = S3Uploader()
@@ -158,10 +229,10 @@ def upload_file():
         })
     
     try:
-        # 检查文件大小
-        file.seek(0, 2)  # 移动到文件末尾
-        file_size = file.tell()
-        file.seek(0)  # 重置到开始位置
+        # 预先读取文件内容来检查大小，避免多次seek操作
+        file.seek(0)
+        file_content = file.read()
+        file_size = len(file_content)
         
         if file_size > app.config['MAX_CONTENT_LENGTH']:
             return jsonify({
@@ -169,13 +240,18 @@ def upload_file():
                 'error': f'文件大小超过限制 ({app.config["MAX_CONTENT_LENGTH"] // (1024*1024)}MB)'
             })
         
-        # 上传文件到S3
-        upload_result = s3_uploader.upload_file(file, file.filename)
+        # 创建新的文件对象用于上传
+        file_for_upload = io.BytesIO(file_content)
+        file_for_upload.content_type = file.content_type
+        file_for_upload.filename = file.filename
+        
+        # 上传文件到MinIO/S3的docs文件夹
+        upload_result = s3_uploader.upload_file(file_for_upload, file.filename)
         
         if upload_result['success']:
             return jsonify({
                 'success': True,
-                'message': '文件上传成功',
+                'message': f'文件成功上传到 docs 文件夹',
                 'data': upload_result
             })
         else:
@@ -185,12 +261,25 @@ def upload_file():
             })
         
     except Exception as e:
+        print(f"上传处理错误: {str(e)}")
         return jsonify({'success': False, 'error': f'处理过程中发生错误: {str(e)}'})
 
 @app.route('/files')
 def list_files():
-    """获取最近上传的文件列表"""
+    """获取docs文件夹下最近上传的文件列表"""
     result = s3_uploader.list_recent_files()
+    return jsonify(result)
+
+@app.route('/delete/<path:file_key>', methods=['DELETE'])
+def delete_file(file_key):
+    """删除docs文件夹下的文件"""
+    result = s3_uploader.delete_file(file_key)
+    return jsonify(result)
+
+@app.route('/file-info/<path:file_key>')
+def get_file_info(file_key):
+    """获取文件详细信息"""
+    result = s3_uploader.get_file_info(file_key)
     return jsonify(result)
 
 @app.route('/health')
@@ -199,8 +288,18 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        's3_configured': s3_uploader.s3_client is not None
+        's3_configured': s3_uploader.s3_client is not None,
+        'minio_endpoint': "http://minio-service.minio.svc.cluster.local:9000",
+        'bucket_name': app.config['S3_BUCKET_NAME'],
+        'upload_folder': 'docs'
     })
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({
+        'success': False,
+        'error': f'文件大小超过限制 ({app.config["MAX_CONTENT_LENGTH"] // (1024*1024)}MB)'
+    }), 413
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
