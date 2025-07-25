@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S3 文件上传器</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 S3 文件上传器</h1>
+        
+        <div class="upload-section">
+            <form id="uploadForm" enctype="multipart/form-data">
+                <div class="file-input-container">
+                    <input type="file" id="fileInput" name="file" required>
+                    <label for="fileInput" class="file-input-label">
+                        <div class="file-icon">📁</div>
+                        <span id="fileInputText">点击选择文件或拖拽文件到此处</span>
+                        <div class="file-info">
+                            <small>支持格式: txt, pdf, png, jpg, jpeg, gif, csv, json, xml, doc, docx, xls, xlsx, ppt, pptx, zip, rar, mp4, mp3</small>
+                            <small>最大文件大小: 16MB</small>
+                        </div>
+                    </label>
+                </div>
+                
+                <button type="submit" id="uploadBtn" class="upload-btn">
+                    <span id="uploadBtnText">📤 上传到 S3</span>
+                    <div id="loadingSpinner" class="spinner" style="display: none;"></div>
+                </button>
+            </form>
+        </div>
+        
+        <div id="result" class="result-section" style="display: none;">
+            <div id="resultContent"></div>
+        </div>
+        
+        <div class="files-section">
+            <div class="section-header">
+                <h3>📋 最近上传的文件</h3>
+                <button id="refreshFilesBtn" class="refresh-btn">🔄 刷新</button>
+            </div>
+            <div id="filesList" class="files-list">
+                <div class="loading">正在加载...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 文件拖拽功能
+        const fileInputLabel = document.querySelector('.file-input-label');
+        const fileInput = document.getElementById('fileInput');
+        
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            fileInputLabel.addEventListener(eventName, preventDefaults, false);
+        });
+        
+        function preventDefaults(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+        
+        ['dragenter', 'dragover'].forEach(eventName => {
+            fileInputLabel.addEventListener(eventName, highlight, false);
+        });
+        
+        ['dragleave', 'drop'].forEach(eventName => {
+            fileInputLabel.addEventListener(eventName, unhighlight, false);
+        });
+        
+        function highlight(e) {
+            fileInputLabel.classList.add('drag-over');
+        }
+        
+        function unhighlight(e) {
+            fileInputLabel.classList.remove('drag-over');
+        }
+        
+        fileInputLabel.addEventListener('drop', handleDrop, false);
+        
+        function handleDrop(e) {
+            const dt = e.dataTransfer;
+            const files = dt.files;
+            fileInput.files = files;
+            updateFileName();
+        }
+        
+        // 文件选择处理
+        fileInput.addEventListener('change', updateFileName);
+        
+        function updateFileName() {
+            const fileName = fileInput.files[0] ? fileInput.files[0].name : '点击选择文件或拖拽文件到此处';
+            document.getElementById('fileInputText').textContent = fileName;
+        }
+        
+        // 表单提交处理
+        document.getElementById('uploadForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const fileInput = document.getElementById('fileInput');
+            const uploadBtn = document.getElementById('uploadBtn');
+            const uploadBtnText = document.getElementById('uploadBtnText');
+            const loadingSpinner = document.getElementById('loadingSpinner');
+            const resultDiv = document.getElementById('result');
+            const resultContent = document.getElementById('resultContent');
+            
+            if (!fileInput.files[0]) {
+                alert('请选择一个文件');
+                return;
+            }
+            
+            // 显示加载状态
+            uploadBtn.disabled = true;
+            uploadBtnText.style.display = 'none';
+            loadingSpinner.style.display = 'inline-block';
+            resultDiv.style.display = 'none';
+            
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    const data = result.data;
+                    resultContent.innerHTML = `
+                        <div class="success">
+                            <h3>✅ 上传成功!</h3>
+                            <div class="file-details">
+                                <p><strong>原始文件名:</strong> ${data.original_filename}</p>
+                                <p><strong>S3文件名:</strong> ${data.filename}</p>
+                                <p><strong>文件大小:</strong> ${formatFileSize(data.size)}</p>
+                                <p><strong>上传时间:</strong> ${data.upload_time}</p>
+                                <p><strong>文件URL:</strong></p>
+                                <div class="url-container">
+                                    <input type="text" value="${data.url}" readonly class="url-input" id="fileUrl">
+                                    <button onclick="copyToClipboard('fileUrl')" class="copy-btn">📋 复制</button>
+                                </div>
+                                <p><a href="${data.url}" target="_blank" class="view-link">🔗 查看文件</a></p>
+                            </div>
+                        </div>
+                    `;
+                    
+                    // 刷新文件列表
+                    loadFilesList();
+                    
+                    // 清空表单
+                    fileInput.value = '';
+                    updateFileName();
+                } else {
+                    resultContent.innerHTML = `
+                        <div class="error">
+                            <h3>❌ 上传失败</h3>
+                            <p>${result.error}</p>
+                        </div>
+                    `;
+                }
+                
+                resultDiv.style.display = 'block';
+                
+            } catch (error) {
+                resultContent.innerHTML = `
+                    <div class="error">
+                        <h3>❌ 网络错误</h3>
+                        <p>${error.message}</p>
+                    </div>
+                `;
+                resultDiv.style.display = 'block';
+            } finally {
+                // 恢复按钮状态
+                uploadBtn.disabled = false;
+                uploadBtnText.style.display = 'inline';
+                loadingSpinner.style.display = 'none';
+            }
+        });
+        
+        // 加载文件列表
+        async function loadFilesList() {
+            const filesList = document.getElementById('filesList');
+            filesList.innerHTML = '<div class="loading">正在加载...</div>';
+            
+            try {
+                const response = await fetch('/files');
+                const result = await response.json();
+                
+                if (result.success && result.files.length > 0) {
+                    filesList.innerHTML = result.files.map(file => `
+                        <div class="file-item">
+                            <div class="file-info">
+                                <div class="file-name">${file.key}</div>
+                                <div class="file-meta">
+                                    <span>大小: ${formatFileSize(file.size)}</span>
+                                    <span>时间: ${file.last_modified}</span>
+                                </div>
+                            </div>
+                            <div class="file-actions">
+                                <a href="${file.url}" target="_blank" class="action-btn view-btn">查看</a>
+                                <button onclick="copyToClipboard('url-${file.key}')" class="action-btn copy-btn">复制链接</button>
+                                <input type="hidden" id="url-${file.key}" value="${file.url}">
+                            </div>
+                        </div>
+                    `).join('');
+                } else {
+                    filesList.innerHTML = '<div class="no-files">暂无文件</div>';
+                }
+            } catch (error) {
+                filesList.innerHTML = '<div class="error">加载失败: ' + error.message + '</div>';
+            }
+        }
+        
+        // 格式化文件大小
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+        
+        // 复制到剪贴板
+        function copyToClipboard(elementId) {
+            const element = document.getElementById(elementId);
+            element.select();
+            document.execCommand('copy');
+            
+            // 显示复制成功提示
+            const originalText = event.target.textContent;
+            event.target.textContent = '✅ 已复制';
+            setTimeout(() => {
+                event.target.textContent = originalText;
+            }, 2000);
+        }
+        
+        // 刷新文件列表
+        document.getElementById('refreshFilesBtn').addEventListener('click', loadFilesList);
+        
+        // 页面加载时获取文件列表
+        document.addEventListener('DOMContentLoaded', loadFilesList);
+    </script>
+</body>
+</html>
